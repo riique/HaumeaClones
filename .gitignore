@@ -1,0 +1,49 @@
+# Dependencies
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+dist/
+dist-python/
+release/
+build/
+*.spec
+
+# Vite
+.vite/
+
+# Electron
+out/
+
+# Telethon session (SENSITIVE — never commit)
+*.session
+*.session-journal
+
+# User config (contains API credentials)
+config.json
+
+# Progress state
+progress/
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Env
+.env
+.env.local
+.env.*.local

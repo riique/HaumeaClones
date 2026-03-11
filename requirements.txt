@@ -1,0 +1,14 @@
+# Haumea Server v2.0 Dependencies
+# Tested on Python 3.9+
+
+# Core
+telethon>=1.36.0
+
+# Performance: Native crypto acceleration (10x faster encryption)
+cryptg
+
+# Proxy support (optional)
+pysocks
+
+# Note: aiofiles not required - using sync I/O in async context
+# is acceptable for this use case since disk I/O is not the bottleneck
