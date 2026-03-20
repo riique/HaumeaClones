@@ -34,6 +34,7 @@ from telethon.tl.types import (
     DocumentAttributeAudio, DocumentAttributeAnimated,
     PeerChannel, InputPeerChannel, InputChannel,
     Channel, ChannelForbidden,
+    MessageActionTopicCreate, MessageActionTopicEdit,
     MessageMediaUnsupported, DocumentAttributeFilename
 )
 from telethon.tl.tlobject import TLRequest
@@ -2177,11 +2178,17 @@ class HaumeaServer:
             try:
                 source_entity, source_topic_id = await self.resolve_target(src)
                 source_forum_title = getattr(source_entity, 'title', str(src))
+                topic_title = source_forum_title
                 source_title = source_forum_title
                 if source_topic_id:
-                    source_title = f"{source_title} > tópico {source_topic_id}"
-                topic_id = await self.create_forum_topic(dest_entity, source_forum_title)
-                self.log(f"Tópico criado: '{source_forum_title}' (ID: {topic_id})", "success")
+                    topic_title = await self.resolve_forum_topic_title(
+                        source_entity,
+                        source_topic_id,
+                        fallback_title=source_forum_title,
+                    )
+                    source_title = f"{source_forum_title} > {topic_title}"
+                topic_id = await self.create_forum_topic(dest_entity, topic_title)
+                self.log(f"Tópico criado: '{topic_title}' (ID: {topic_id})", "success")
                 result = await self.clone_to_topic(
                     source_entity,
                     dest_entity,
@@ -2216,10 +2223,40 @@ class HaumeaServer:
                 for t in result.topics:
                     if hasattr(t, 'id') and hasattr(t, 'title'):
                         if t.id != 1:  # Skip General topic
-                            topics.append({"id": t.id, "title": t.title})
+                            topics.append({
+                                "id": t.id,
+                                "title": t.title,
+                                "top_message": getattr(t, "top_message", None),
+                            })
         except Exception as e:
             self.log(f"Erro ao obter tópicos: {e}", "error")
         return topics
+
+    async def resolve_forum_topic_title(self, entity, topic_id, fallback_title=None):
+        topics = await self.get_forum_topics(entity)
+        for topic in topics:
+            if topic.get("id") == topic_id or topic.get("top_message") == topic_id:
+                return topic.get("title") or fallback_title or f"Tópico {topic_id}"
+
+        resolved_title = None
+        try:
+            async for msg in self.client.iter_messages(
+                entity,
+                **self.get_iter_messages_kwargs(limit=50, reverse=True, reply_to=topic_id)
+            ):
+                action = getattr(msg, "action", None)
+                if isinstance(action, (MessageActionTopicCreate, MessageActionTopicEdit)):
+                    title = getattr(action, "title", None)
+                    if title:
+                        resolved_title = title
+        except Exception:
+            pass
+
+        if resolved_title:
+            return resolved_title
+        if fallback_title:
+            return fallback_title
+        return getattr(entity, "title", None) or f"Tópico {topic_id}"
 
     async def clone_topic_messages(
         self,
@@ -2319,7 +2356,12 @@ class HaumeaServer:
             await self._get_forum_input_channel(source_entity, "grupo de origem")
 
         if source_topic_id:
-            source_topics = [{"id": source_topic_id, "title": f"Tópico {source_topic_id}"}]
+            source_topic_title = await self.resolve_forum_topic_title(
+                source_entity,
+                source_topic_id,
+                fallback_title=getattr(source_entity, "title", None),
+            )
+            source_topics = [{"id": source_topic_id, "title": source_topic_title}]
         else:
             source_topics = await self.get_forum_topics(source_entity)
         total_topics = len(source_topics)

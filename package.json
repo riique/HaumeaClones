@@ -1,6 +1,6 @@
 {
   "name": "haumea-clones",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Ferramenta profissional de clonagem de canais do Telegram",
   "main": "electron/main.cjs",
   "scripts": {
@@ -15,7 +15,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/riique/Haumea-Clones-Via-Electron-.git"
+    "url": "git+https://github.com/riique/HaumeaClones.git"
   },
   "build": {
     "appId": "com.riique.haumea-clones",
@@ -53,7 +53,7 @@
       {
         "provider": "github",
         "owner": "riique",
-        "repo": "Haumea-Clones-Via-Electron-",
+        "repo": "HaumeaClones",
         "releaseType": "release"
       }
     ]
