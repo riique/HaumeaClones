@@ -1,6 +1,6 @@
 {
   "name": "haumea-clones",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "Ferramenta profissional de clonagem de canais do Telegram",
   "main": "electron/main.cjs",
   "scripts": {

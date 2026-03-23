@@ -24,7 +24,7 @@ if str(ROOT_DIR) not in sys.path:
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, RPCError
 from telethon.sessions import StringSession
-from telethon.tl import functions, types
+from telethon.tl import functions
 from telethon.utils import get_input_channel
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage,
@@ -211,6 +211,27 @@ class HaumeaServer:
     def log(self, message, tag="info"):
         ts = datetime.now().strftime("%H:%M:%S")
         self._notify("log", {"time": ts, "message": message, "tag": tag})
+
+    def _log_scope(self, scope, message, tag="info"):
+        labels = {
+            "clone": "CLONE",
+            "sync": "SYNC",
+            "multi": "MULTI",
+            "forum": "FORUM",
+            "topic": "TOPIC",
+            "copy": "COPY",
+            "ram": "RAM",
+            "retry": "RETRY",
+        }
+        prefix = labels.get(scope, str(scope).upper())
+        self.log(f"[{prefix}] {message}", tag)
+
+    def _log_route_summary(self, scope, copy_message_used=0, ram_bypass_used=0, tag="info"):
+        self._log_scope(
+            scope,
+            f"Rotas usadas | copy_message: {copy_message_used} | bypass RAM: {ram_bypass_used}",
+            tag,
+        )
 
     def emit_progress(self, data):
         self._notify("progress", data)
@@ -1224,10 +1245,9 @@ class HaumeaServer:
         )
         return any(token in error_text for token in restricted_tokens)
 
-    def _build_input_reply_to(self, reply_to=None):
-        if not reply_to:
-            return None
-        return types.InputReplyToMessage(reply_to, top_msg_id=reply_to)
+    def _is_message_id_invalid_error(self, exc):
+        lowered = f"{type(exc).__name__} {exc}".lower()
+        return "messageidinvalid" in lowered or "message_id_invalid" in lowered
 
     def _should_fallback_after_copy_failure(self, exc):
         if isinstance(exc, FloodWaitError):
@@ -1329,7 +1349,7 @@ class HaumeaServer:
                 return await coro_func(*args, **kwargs)
             except FloodWaitError as exc:
                 wait_seconds = max(int(getattr(exc, "seconds", 0) or 0), 1) + 2
-                self.log(f"FloodWait durante {action}: aguardando {wait_seconds}s para retry...", "warning")
+                self._log_scope("retry", f"FloodWait em {action}; retry em {wait_seconds}s.", "warning")
                 await asyncio.sleep(wait_seconds)
 
     async def _send_media_via_ram_bypass(self, dest_entity, msg, reply_to=None):
@@ -1338,7 +1358,7 @@ class HaumeaServer:
 
         self._last_send_used_copy_message = False
         self._last_send_used_ram_bypass = True
-        self.log("Protegido detectado -> baixando na RAM e reenviando", "warning")
+        self._log_scope("ram", f"Mensagem #{msg.id} protegida; reenviando via RAM.", "warning")
         attributes = self._extract_media_attributes(msg)
         download_action = f"download em RAM da msg #{msg.id}"
         upload_action = f"reupload em RAM da msg #{msg.id}"
@@ -1399,7 +1419,7 @@ class HaumeaServer:
             random_id=[random.randint(1, 2**63 - 1)],
             to_peer=await self.client.get_input_entity(dest_entity),
             drop_author=True,
-            reply_to=self._build_input_reply_to(reply_to),
+            top_msg_id=reply_to or None,
         )
         await self.client(request)
         return True
@@ -1441,7 +1461,7 @@ class HaumeaServer:
                 return False
 
             if getattr(msg, "noforwards", False):
-                self.log(f"Bypass RAM ativado para msg protegida #{msg.id}", "warning")
+                self._log_scope("ram", f"Mensagem #{msg.id} marcada como protegida; usando bypass RAM.", "warning")
                 return await self._send_media_via_ram_bypass(dest_entity, msg, reply_to=reply_to)
 
             try:
@@ -1457,7 +1477,7 @@ class HaumeaServer:
                 return True
             except Exception as exc:
                 if self._is_restricted_forward_error(exc):
-                    self.log(f"Bypass RAM ativado para msg #{msg.id} após bloqueio: {exc}", "warning")
+                    self._log_scope("ram", f"Mensagem #{msg.id} bloqueou envio direto; usando bypass RAM.", "warning")
                     return await self._send_media_via_ram_bypass(dest_entity, msg, reply_to=reply_to)
                 raise
 
@@ -1485,10 +1505,12 @@ class HaumeaServer:
         except Exception as exc:
             if not self._should_fallback_after_copy_failure(exc):
                 raise
-            self.log(
-                f"copy_message falhou na msg #{msg.id}; usando fallback legado ({type(exc).__name__}: {exc})",
-                "warning",
-            )
+            if not self._is_message_id_invalid_error(exc):
+                self._log_scope(
+                    "copy",
+                    f"Mensagem #{msg.id} falhou no copy_message ({type(exc).__name__}); usando fallback.",
+                    "warning",
+                )
 
         return await self._send_message_via_legacy_fallback(dest_entity, msg, reply_to=reply_to)
 
@@ -1594,7 +1616,7 @@ class HaumeaServer:
         skipped_duplicates = 0
 
         self.emit_progress({"type": "clone", "status": "starting", "copy_message_used": 0})
-        self.log("Resolvendo entidades...", "info")
+        self._log_scope("clone", "Preparando operação e resolvendo entidades...", "info")
 
         source_entity, source_topic_id = await self.resolve_target(source)
         dest_entity, dest_topic_id = await self.resolve_target(dest)
@@ -1605,8 +1627,8 @@ class HaumeaServer:
             source_title = f"{source_title} > tópico {source_topic_id}"
         if dest_topic_id:
             dest_title = f"{dest_title} > tópico {dest_topic_id}"
-        self.log(f"Origem: {source_title}", "info")
-        self.log(f"Destino: {dest_title}", "info")
+        self._log_scope("clone", f"Origem  | {source_title}", "info")
+        self._log_scope("clone", f"Destino | {dest_title}", "info")
         self._set_active_job("clone", {
             "status": "starting",
             "source_title": source_title,
@@ -1629,10 +1651,10 @@ class HaumeaServer:
             **self.get_iter_messages_kwargs(limit=limit, reply_to=source_topic_id)
         ):
             total += 1
-        self.log(f"Total de mensagens: {total}", "info")
+        self._log_scope("clone", f"Mensagens no escopo: {total}", "info")
 
         if total == 0:
-            self.log("Nenhuma mensagem encontrada!", "warning")
+            self._log_scope("clone", "Nenhuma mensagem encontrada no escopo.", "warning")
             self.emit_progress({
                 "type": "clone",
                 "status": "done",
@@ -1686,7 +1708,7 @@ class HaumeaServer:
 
         for msg in messages:
             if self.stop_flag:
-                self.log("Clonagem interrompida!", "warning")
+                self._log_scope("clone", "Operação interrompida pelo usuário.", "warning")
                 self.save_progress(
                     source,
                     dest,
@@ -1800,7 +1822,7 @@ class HaumeaServer:
                 })
 
                 if completed % 10 == 0:
-                    self.log(f"Progresso: {completed}/{total_scope} ({pct}%)", "info")
+                    self._log_scope("clone", f"Progresso | {completed}/{total_scope} ({pct}%)", "info")
                     self.save_progress(
                         source,
                         dest,
@@ -1820,9 +1842,9 @@ class HaumeaServer:
 
                 if anti_flood_cycle and cloned >= anti_flood_cycle["after_messages"]:
                     pause_seconds = anti_flood_cycle["duration"]
-                    self.log(
-                        f"Proteção local: pausando {self._format_seconds(pause_seconds)}s "
-                        f"após {anti_flood_cycle['frequency']} envios neste ciclo.",
+                    self._log_scope(
+                        "clone",
+                        f"Pausa anti-flood | {self._format_seconds(pause_seconds)}s após {anti_flood_cycle['frequency']} envios.",
                         "warning",
                     )
                     await asyncio.sleep(pause_seconds)
@@ -1832,7 +1854,7 @@ class HaumeaServer:
 
             except FloodWaitError as e:
                 wait = e.seconds + 5
-                self.log(f"FloodWait: aguardando {wait}s...", "error")
+                self._log_scope("clone", f"FloodWait detectado; aguardando {wait}s para retomar.", "error")
                 self._record_error(e, "clone", {"source": source_title, "dest": dest_title, "message_id": msg.id})
                 self.save_progress(
                     source,
@@ -1853,7 +1875,7 @@ class HaumeaServer:
             except Exception as e:
                 errors += 1
                 self._record_error(e, "clone", {"source": source_title, "dest": dest_title, "message_id": msg.id})
-                self.log(f"Erro msg #{msg.id}: {e}", "error")
+                self._log_scope("clone", f"Erro na mensagem #{msg.id}: {e}", "error")
 
         if dedupe_enabled:
             dedupe_state = self.save_dedupe_state(source, dest, dedupe_state)
@@ -1862,11 +1884,12 @@ class HaumeaServer:
         status = "stopped" if self.stop_flag else "success"
         if not self.stop_flag:
             self.delete_progress_file(source, dest)
-        self.log(
-            f"Clonagem concluída! {completed}/{total_scope} mensagens, {errors} erros, {skipped_duplicates} duplicadas",
+        self._log_scope(
+            "clone",
+            f"Concluído | mensagens: {completed}/{total_scope} | erros: {errors} | duplicadas: {skipped_duplicates}",
             "success" if not self.stop_flag else "warning",
         )
-        self.log(f"copy_message usado com sucesso na clonagem: {copy_message_used}", "info")
+        self._log_route_summary("clone", copy_message_used=copy_message_used, ram_bypass_used=ram_bypass_used, tag="info")
         self.emit_progress({
             "type": "clone",
             "status": "done" if not self.stop_flag else "stopped",
@@ -1926,7 +1949,7 @@ class HaumeaServer:
 
     async def rpc_stop(self):
         self.stop_flag = True
-        self.log("Parando clonagem...", "warning")
+        self._log_scope("clone", "Solicitação de parada recebida.", "warning")
         return {"ok": True}
 
     async def _live_sync_loop(self, source, dest, source_entity, dest_entity, source_title, dest_title,
@@ -1974,9 +1997,9 @@ class HaumeaServer:
                                 self.mark_message_deduped(dedupe_state, msg)
                             if anti_flood_cycle and self.sync_state["processed"] >= anti_flood_cycle["after_messages"]:
                                 pause_seconds = anti_flood_cycle["duration"]
-                                self.log(
-                                    f"Proteção local: pausando {self._format_seconds(pause_seconds)}s "
-                                    f"após {anti_flood_cycle['frequency']} envios neste ciclo.",
+                                self._log_scope(
+                                    "sync",
+                                    f"Pausa anti-flood | {self._format_seconds(pause_seconds)}s após {anti_flood_cycle['frequency']} envios.",
                                     "warning",
                                 )
                                 await asyncio.sleep(pause_seconds)
@@ -2016,7 +2039,7 @@ class HaumeaServer:
                     except Exception as exc:
                         self.sync_state["errors"] += 1
                         self._record_error(exc, "sync", {"source": source_title, "dest": dest_title, "message_id": msg.id})
-                        self.log(f"Erro na sync contínua #{msg.id}: {exc}", "error")
+                        self._log_scope("sync", f"Erro na mensagem #{msg.id}: {exc}", "error")
 
                 if dedupe_state is not None:
                     self.save_dedupe_state(source, dest, dedupe_state)
@@ -2042,7 +2065,7 @@ class HaumeaServer:
             except Exception as exc:
                 self.sync_state["errors"] += 1
                 self._record_error(exc, "sync", {"source": source_title, "dest": dest_title})
-                self.log(f"Loop de sync falhou: {exc}", "error")
+                self._log_scope("sync", f"Loop de sincronização falhou: {exc}", "error")
                 await asyncio.sleep(min(max(poll_interval, 5), 15))
 
     async def rpc_start_live_sync(
@@ -2121,7 +2144,7 @@ class HaumeaServer:
             dedupe_state,
             anti_flood,
         ))
-        self.log(f"Sync contínua iniciada: {source_title} → {dest_title}", "success")
+        self._log_scope("sync", f"Iniciada | {source_title} -> {dest_title}", "success")
         self.emit_progress({
             "type": "sync",
             "status": "active",
@@ -2184,8 +2207,13 @@ class HaumeaServer:
             "source_title": source_title,
             "dest_title": dest_title,
         })
-        self.log(f"copy_message usado com sucesso na sync contínua: {self.sync_state.get('copy_message_used', 0)}", "info")
-        self.log("Sync contínua interrompida.", "warning")
+        self._log_route_summary(
+            "sync",
+            copy_message_used=self.sync_state.get("copy_message_used", 0),
+            ram_bypass_used=self.sync_state.get("ram_bypass_used", 0),
+            tag="info",
+        )
+        self._log_scope("sync", "Sincronização interrompida.", "warning")
         return {"ok": True, "sync_state": self.sync_state}
 
     # ── Multi-Group Clone ──
@@ -2210,7 +2238,7 @@ class HaumeaServer:
                     if hasattr(update, 'id'):
                         return update.id
         except Exception as e:
-            self.log(f"Erro ao criar tópico '{title}': {e}", "error")
+            self._log_scope("forum", f"Falha ao criar tópico '{title}': {e}", "error")
             raise
 
     async def clone_to_topic(
@@ -2236,7 +2264,7 @@ class HaumeaServer:
         ram_bypass_used = 0
         copy_message_used = 0
         anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
-        self.log(f"Clonando {total} msgs de '{source_title}' para tópico...", "info")
+        self._log_scope("topic", f"Clonando '{source_title}' | mensagens: {total}", "info")
 
         for i, msg in enumerate(messages):
             if self.stop_flag:
@@ -2259,24 +2287,23 @@ class HaumeaServer:
                     copy_message_used += 1
                 if anti_flood_cycle and cloned >= anti_flood_cycle["after_messages"]:
                     pause_seconds = anti_flood_cycle["duration"]
-                    self.log(
-                        f"Proteção local: pausando {self._format_seconds(pause_seconds)}s "
-                        f"após {anti_flood_cycle['frequency']} envios neste ciclo.",
+                    self._log_scope(
+                        "topic",
+                        f"Pausa anti-flood | {self._format_seconds(pause_seconds)}s após {anti_flood_cycle['frequency']} envios.",
                         "warning",
                     )
                     await asyncio.sleep(pause_seconds)
                     anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
                 await asyncio.sleep(delay)
             except FloodWaitError as e:
-                self.log(f"FloodWait: aguardando {e.seconds + 5}s...", "error")
+                self._log_scope("topic", f"FloodWait detectado; aguardando {e.seconds + 5}s.", "error")
                 await asyncio.sleep(e.seconds + 5)
                 anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
             except Exception as e:
-                self.log(f"Erro msg #{msg.id}: {e}", "error")
+                self._log_scope("topic", f"Erro na mensagem #{msg.id}: {e}", "error")
 
-        self.log(f"'{source_title}' concluído: {cloned}/{total}", "success")
-        self.log(f"Bypass RAM em '{source_title}': {ram_bypass_used}", "info")
-        self.log(f"copy_message em '{source_title}': {copy_message_used}", "info")
+        self._log_scope("topic", f"Concluído | {source_title} | mensagens: {cloned}/{total}", "success")
+        self._log_route_summary("topic", copy_message_used=copy_message_used, ram_bypass_used=ram_bypass_used, tag="info")
         return {
             "cloned": cloned,
             "ram_bypass_used": ram_bypass_used,
@@ -2318,7 +2345,7 @@ class HaumeaServer:
         total_groups = len(sources)
         total_ram_bypass_used = 0
         total_copy_message_used = 0
-        self.log("Iniciando multi-clone com tentativa de copy_message antes do fallback legado.", "info")
+        self._log_scope("multi", "Iniciando multi-clone com copy_message antes do fallback legado.", "info")
 
         for idx, src in enumerate(sources):
             if self.stop_flag:
@@ -2327,7 +2354,7 @@ class HaumeaServer:
             if not src:
                 continue
 
-            self.log(f"Grupo {idx+1}/{total_groups}: {src}", "info")
+            self._log_scope("multi", f"Grupo {idx+1}/{total_groups} | {src}", "info")
             self.emit_progress({
                 "type": "multi",
                 "group_index": idx,
@@ -2349,7 +2376,7 @@ class HaumeaServer:
                     )
                     source_title = f"{source_forum_title} > {topic_title}"
                 topic_id = await self.create_forum_topic(dest_entity, topic_title)
-                self.log(f"Tópico criado: '{topic_title}' (ID: {topic_id})", "success")
+                self._log_scope("multi", f"Tópico criado | {topic_title} (ID {topic_id})", "success")
                 result = await self.clone_to_topic(
                     source_entity,
                     dest_entity,
@@ -2363,11 +2390,10 @@ class HaumeaServer:
                 total_ram_bypass_used += int((result or {}).get("ram_bypass_used", 0) or 0)
                 total_copy_message_used += int((result or {}).get("copy_message_used", 0) or 0)
             except Exception as e:
-                self.log(f"Erro no grupo '{src}': {e}", "error")
+                self._log_scope("multi", f"Erro no grupo '{src}': {e}", "error")
 
-        self.log("Multi-clone concluído!", "success")
-        self.log(f"Bypass RAM total no multi-clone: {total_ram_bypass_used}", "info")
-        self.log(f"copy_message total no multi-clone: {total_copy_message_used}", "info")
+        self._log_scope("multi", "Multi-clone concluído.", "success")
+        self._log_route_summary("multi", copy_message_used=total_copy_message_used, ram_bypass_used=total_ram_bypass_used, tag="info")
         self.emit_progress({
             "type": "multi",
             "status": "done",
@@ -2397,7 +2423,7 @@ class HaumeaServer:
                                 "top_message": getattr(t, "top_message", None),
                             })
         except Exception as e:
-            self.log(f"Erro ao obter tópicos: {e}", "error")
+            self._log_scope("forum", f"Falha ao obter tópicos: {e}", "error")
         return topics
 
     async def resolve_forum_topic_title(self, entity, topic_id, fallback_title=None):
@@ -2450,7 +2476,7 @@ class HaumeaServer:
         copy_message_used = 0
         errors = 0
         anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
-        self.log(f"Clonando {total} msgs do tópico '{topic_title}'...", "info")
+        self._log_scope("topic", f"Tópico '{topic_title}' | mensagens: {total}", "info")
 
         for i, msg in enumerate(messages):
             if self.stop_flag:
@@ -2473,9 +2499,9 @@ class HaumeaServer:
                     copy_message_used += 1
                 if anti_flood_cycle and cloned >= anti_flood_cycle["after_messages"]:
                     pause_seconds = anti_flood_cycle["duration"]
-                    self.log(
-                        f"Proteção local: pausando {self._format_seconds(pause_seconds)}s "
-                        f"após {anti_flood_cycle['frequency']} envios neste ciclo.",
+                    self._log_scope(
+                        "topic",
+                        f"Pausa anti-flood | {self._format_seconds(pause_seconds)}s após {anti_flood_cycle['frequency']} envios.",
                         "warning",
                     )
                     await asyncio.sleep(pause_seconds)
@@ -2487,9 +2513,10 @@ class HaumeaServer:
                 anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
             except Exception as e:
                 errors += 1
-                self.log(f"Erro msg #{msg.id}: {e}", "error")
+                self._log_scope("topic", f"Erro na mensagem #{msg.id}: {e}", "error")
 
-        self.log(f"copy_message no tópico '{topic_title}': {copy_message_used}", "info")
+        self._log_scope("topic", f"Concluído | {topic_title} | mensagens: {cloned}/{total} | erros: {errors}", "success")
+        self._log_route_summary("topic", copy_message_used=copy_message_used, ram_bypass_used=ram_bypass_used, tag="info")
         return {
             "cloned": cloned,
             "ram_bypass_used": ram_bypass_used,
@@ -2545,13 +2572,13 @@ class HaumeaServer:
         total_ram_bypass_used = 0
         total_copy_message_used = 0
         total_errors = 0
-        self.log(f"Encontrados {total_topics} tópicos no fórum de origem", "info")
+        self._log_scope("forum", f"Tópicos encontrados no fórum de origem: {total_topics}", "info")
 
         for idx, topic in enumerate(source_topics):
             if self.stop_flag:
                 break
 
-            self.log(f"Tópico {idx+1}/{total_topics}: {topic['title']}", "info")
+            self._log_scope("forum", f"Tópico {idx+1}/{total_topics} | {topic['title']}", "info")
             self.emit_progress({
                 "type": "forum", "topic_index": idx, "total_topics": total_topics,
                 "topic_title": topic['title'],
@@ -2562,7 +2589,7 @@ class HaumeaServer:
 
             try:
                 new_topic_id = await self.create_forum_topic(dest_entity, topic['title'])
-                self.log(f"Tópico criado: '{topic['title']}' (ID: {new_topic_id})", "success")
+                self._log_scope("forum", f"Tópico criado | {topic['title']} (ID {new_topic_id})", "success")
                 topic_result = await self.clone_topic_messages(
                     source_entity, topic['id'], dest_entity, new_topic_id,
                     limit, delay, anti_flood, topic['title']
@@ -2572,11 +2599,10 @@ class HaumeaServer:
                 total_errors += int((topic_result or {}).get("errors", 0) or 0)
             except Exception as e:
                 total_errors += 1
-                self.log(f"Erro no tópico '{topic['title']}': {e}", "error")
+                self._log_scope("forum", f"Erro no tópico '{topic['title']}': {e}", "error")
 
-        self.log("Clonagem de fórum concluída!", "success")
-        self.log(f"Bypass RAM total no clone de fórum: {total_ram_bypass_used}", "info")
-        self.log(f"copy_message total no clone de fórum: {total_copy_message_used}", "info")
+        self._log_scope("forum", "Clonagem de fórum concluída.", "success")
+        self._log_route_summary("forum", copy_message_used=total_copy_message_used, ram_bypass_used=total_ram_bypass_used, tag="info")
         self.emit_progress({
             "type": "forum",
             "status": "done",
