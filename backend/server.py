@@ -24,6 +24,7 @@ if str(ROOT_DIR) not in sys.path:
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FloodWaitError, RPCError
 from telethon.sessions import StringSession
+from telethon.tl import functions, types
 from telethon.utils import get_input_channel
 from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDocument, MessageMediaWebPage,
@@ -187,6 +188,7 @@ class HaumeaServer:
             "processed": 0,
             "media_files": 0,
             "ram_bypass_used": 0,
+            "copy_message_used": 0,
             "skipped_duplicates": 0,
             "errors": 0,
             "poll_interval": 15,
@@ -197,6 +199,7 @@ class HaumeaServer:
         }
         self.connect_timeout = 25
         self._last_send_used_ram_bypass = False
+        self._last_send_used_copy_message = False
 
     # ── Notifications (push to Electron) ──
 
@@ -602,6 +605,7 @@ class HaumeaServer:
         total_processed = sum(int(item.get("cloned", 0) or 0) for item in history_items)
         total_media = sum(int(item.get("media_files", 0) or 0) for item in history_items)
         total_ram_bypass = sum(int(item.get("ram_bypass_used", item.get("downloaded", 0)) or 0) for item in history_items)
+        total_copy_message = sum(int(item.get("copy_message_used", 0) or 0) for item in history_items)
         total_errors = sum(int(item.get("errors", 0) or 0) for item in history_items)
         total_duplicates = sum(int(item.get("skipped_duplicates", 0) or 0) for item in history_items)
         avg_rate = 0
@@ -621,6 +625,7 @@ class HaumeaServer:
                 "total_processed": total_processed,
                 "total_media": total_media,
                 "total_ram_bypass": total_ram_bypass,
+                "total_copy_message": total_copy_message,
                 "total_errors": total_errors,
                 "total_duplicates": total_duplicates,
                 "avg_rate": avg_rate,
@@ -1219,6 +1224,67 @@ class HaumeaServer:
         )
         return any(token in error_text for token in restricted_tokens)
 
+    def _build_input_reply_to(self, reply_to=None):
+        if not reply_to:
+            return None
+        return types.InputReplyToMessage(reply_to, top_msg_id=reply_to)
+
+    def _should_fallback_after_copy_failure(self, exc):
+        if isinstance(exc, FloodWaitError):
+            return False
+        if isinstance(exc, (AttributeError, NotImplementedError, TypeError)):
+            return True
+
+        lowered = f"{type(exc).__name__} {exc}".lower()
+        blocking_tokens = (
+            "timeout",
+            "timed out",
+            "network",
+            "connection",
+            "session",
+            "authorized",
+            "authorization",
+            "password",
+            "forbidden",
+            "permission",
+            "write forbidden",
+            "admin",
+            "banned",
+            "slowmode",
+            "slow mode",
+        )
+        if any(token in lowered for token in blocking_tokens):
+            return False
+
+        compatible_tokens = (
+            "copy",
+            "forward",
+            "drop_author",
+            "drop_media_captions",
+            "messageidinvalid",
+            "message_id_invalid",
+            "media empty",
+            "media_empty",
+            "media invalid",
+            "grouped_media_invalid",
+            "reply_to",
+            "topic",
+            "top_msg_id",
+            "unsupported",
+            "poll",
+            "contact",
+            "geo",
+            "venue",
+            "dice",
+            "game",
+            "invoice",
+        )
+        return (
+            self._is_restricted_forward_error(exc)
+            or isinstance(exc, RPCError)
+            or any(token in lowered for token in compatible_tokens)
+        )
+
     def _extract_media_attributes(self, msg):
         attributes = getattr(msg.media, "attributes", None)
         document = getattr(msg.media, "document", None)
@@ -1270,6 +1336,7 @@ class HaumeaServer:
         if not msg.media:
             return False
 
+        self._last_send_used_copy_message = False
         self._last_send_used_ram_bypass = True
         self.log("Protegido detectado -> baixando na RAM e reenviando", "warning")
         attributes = self._extract_media_attributes(msg)
@@ -1313,8 +1380,32 @@ class HaumeaServer:
         )
         return True
 
-    async def _send_message_like_main(self, dest_entity, msg, reply_to=None):
-        self._last_send_used_ram_bypass = False
+    async def _copy_message_first(self, source_entity, dest_entity, msg, reply_to=None):
+        copy_method = getattr(self.client, "copy_message", None)
+        if callable(copy_method):
+            kwargs = {
+                "chat_id": dest_entity,
+                "from_chat_id": source_entity,
+                "message_id": msg.id,
+            }
+            if reply_to:
+                kwargs["reply_to_message_id"] = reply_to
+            await copy_method(**kwargs)
+            return True
+
+        request = functions.messages.ForwardMessagesRequest(
+            from_peer=await self.client.get_input_entity(source_entity),
+            id=[msg.id],
+            random_id=[random.randint(1, 2**63 - 1)],
+            to_peer=await self.client.get_input_entity(dest_entity),
+            drop_author=True,
+            reply_to=self._build_input_reply_to(reply_to),
+        )
+        await self.client(request)
+        return True
+
+    async def _send_message_via_legacy_fallback(self, dest_entity, msg, reply_to=None):
+        self._last_send_used_copy_message = False
         kwargs = {}
         if reply_to:
             kwargs["reply_to"] = reply_to
@@ -1382,9 +1473,28 @@ class HaumeaServer:
 
         return False
 
+    async def _send_message_like_main(self, source_entity, dest_entity, msg, reply_to=None):
+        self._last_send_used_ram_bypass = False
+        self._last_send_used_copy_message = False
+
+        try:
+            sent = await self._copy_message_first(source_entity, dest_entity, msg, reply_to=reply_to)
+            if sent:
+                self._last_send_used_copy_message = True
+            return sent
+        except Exception as exc:
+            if not self._should_fallback_after_copy_failure(exc):
+                raise
+            self.log(
+                f"copy_message falhou na msg #{msg.id}; usando fallback legado ({type(exc).__name__}: {exc})",
+                "warning",
+            )
+
+        return await self._send_message_via_legacy_fallback(dest_entity, msg, reply_to=reply_to)
+
     async def _deliver_message_with_refresh(self, source_entity, dest_entity, msg, reply_to=None):
         try:
-            sent = await self._send_message_like_main(dest_entity, msg, reply_to=reply_to)
+            sent = await self._send_message_like_main(source_entity, dest_entity, msg, reply_to=reply_to)
             return sent, msg
         except Exception as exc:
             if not is_file_reference_error(exc):
@@ -1395,7 +1505,7 @@ class HaumeaServer:
             if not refreshed_msg:
                 raise
 
-            sent = await self._send_message_like_main(dest_entity, refreshed_msg, reply_to=reply_to)
+            sent = await self._send_message_like_main(source_entity, dest_entity, refreshed_msg, reply_to=reply_to)
             return sent, refreshed_msg
 
     def _format_bytes(self, bytes_value):
@@ -1483,7 +1593,7 @@ class HaumeaServer:
         )
         skipped_duplicates = 0
 
-        self.emit_progress({"type": "clone", "status": "starting"})
+        self.emit_progress({"type": "clone", "status": "starting", "copy_message_used": 0})
         self.log("Resolvendo entidades...", "info")
 
         source_entity, source_topic_id = await self.resolve_target(source)
@@ -1507,6 +1617,7 @@ class HaumeaServer:
             "processed": 0,
             "media_files": 0,
             "ram_bypass_used": 0,
+            "copy_message_used": 0,
             "total": 0,
             "errors": 0,
             "skipped_duplicates": 0,
@@ -1522,7 +1633,13 @@ class HaumeaServer:
 
         if total == 0:
             self.log("Nenhuma mensagem encontrada!", "warning")
-            self.emit_progress({"type": "clone", "status": "done", "cloned": 0, "total": 0})
+            self.emit_progress({
+                "type": "clone",
+                "status": "done",
+                "cloned": 0,
+                "total": 0,
+                "copy_message_used": 0,
+            })
             self._finish_active_job({
                 "operation": "clone",
                 "status": "success",
@@ -1533,17 +1650,19 @@ class HaumeaServer:
                 "processed": 0,
                 "media_files": 0,
                 "ram_bypass_used": 0,
+                "copy_message_used": 0,
                 "total": 0,
                 "errors": 0,
                 "skipped_duplicates": 0,
                 "messages_per_minute": 0,
             })
-            return {"ok": True, "cloned": 0}
+            return {"ok": True, "cloned": 0, "copy_message_used": 0}
 
         resume_entry = self.get_saved_progress_entry(source, dest) if resume_from_msg_id else None
         resume_offset = int((resume_entry or {}).get("cloned", 0) or 0)
         media_files = int((resume_entry or {}).get("media_files", 0) or 0)
         ram_bypass_used = int((resume_entry or {}).get("ram_bypass_used", 0) or 0)
+        copy_message_used = int((resume_entry or {}).get("copy_message_used", 0) or 0)
 
         messages = []
         async for msg in self.client.iter_messages(
@@ -1576,7 +1695,11 @@ class HaumeaServer:
                     total_scope,
                     source_title,
                     dest_title,
-                    {"media_files": media_files, "ram_bypass_used": ram_bypass_used},
+                    {
+                        "media_files": media_files,
+                        "ram_bypass_used": ram_bypass_used,
+                        "copy_message_used": copy_message_used,
+                    },
                 )
                 break
 
@@ -1597,6 +1720,7 @@ class HaumeaServer:
                         "media_type": media_type,
                         "media_files": media_files,
                         "ram_bypass_used": ram_bypass_used,
+                        "copy_message_used": copy_message_used,
                         "skipped_duplicates": skipped_duplicates,
                         **metrics,
                     })
@@ -1610,6 +1734,7 @@ class HaumeaServer:
                         "processed": completed,
                         "media_files": media_files,
                         "ram_bypass_used": ram_bypass_used,
+                        "copy_message_used": copy_message_used,
                         "total": total_scope,
                         "errors": errors,
                         "skipped_duplicates": skipped_duplicates,
@@ -1638,6 +1763,8 @@ class HaumeaServer:
                     media_files += 1
                 if self._last_send_used_ram_bypass:
                     ram_bypass_used += 1
+                if self._last_send_used_copy_message:
+                    copy_message_used += 1
                 if dedupe_enabled:
                     self.mark_message_deduped(dedupe_state, msg)
                 pct = int((completed / total_scope) * 100) if total_scope else 0
@@ -1651,6 +1778,7 @@ class HaumeaServer:
                     "media_type": media_type,
                     "media_files": media_files,
                     "ram_bypass_used": ram_bypass_used,
+                    "copy_message_used": copy_message_used,
                     "skipped_duplicates": skipped_duplicates,
                     **metrics,
                 })
@@ -1664,6 +1792,7 @@ class HaumeaServer:
                     "processed": completed,
                     "media_files": media_files,
                     "ram_bypass_used": ram_bypass_used,
+                    "copy_message_used": copy_message_used,
                     "total": total_scope,
                     "errors": errors,
                     "skipped_duplicates": skipped_duplicates,
@@ -1680,7 +1809,11 @@ class HaumeaServer:
                         total_scope,
                         source_title,
                         dest_title,
-                        {"media_files": media_files, "ram_bypass_used": ram_bypass_used},
+                        {
+                            "media_files": media_files,
+                            "ram_bypass_used": ram_bypass_used,
+                            "copy_message_used": copy_message_used,
+                        },
                     )
                     if dedupe_enabled:
                         dedupe_state = self.save_dedupe_state(source, dest, dedupe_state)
@@ -1709,7 +1842,11 @@ class HaumeaServer:
                     total_scope,
                     source_title,
                     dest_title,
-                    {"media_files": media_files, "ram_bypass_used": ram_bypass_used},
+                    {
+                        "media_files": media_files,
+                        "ram_bypass_used": ram_bypass_used,
+                        "copy_message_used": copy_message_used,
+                    },
                 )
                 await asyncio.sleep(wait)
                 anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
@@ -1729,6 +1866,7 @@ class HaumeaServer:
             f"Clonagem concluída! {completed}/{total_scope} mensagens, {errors} erros, {skipped_duplicates} duplicadas",
             "success" if not self.stop_flag else "warning",
         )
+        self.log(f"copy_message usado com sucesso na clonagem: {copy_message_used}", "info")
         self.emit_progress({
             "type": "clone",
             "status": "done" if not self.stop_flag else "stopped",
@@ -1736,6 +1874,7 @@ class HaumeaServer:
             "total": total_scope,
             "media_files": media_files,
             "ram_bypass_used": ram_bypass_used,
+            "copy_message_used": copy_message_used,
             "errors": errors,
             "skipped_duplicates": skipped_duplicates,
             **metrics,
@@ -1752,6 +1891,7 @@ class HaumeaServer:
             total=total_scope,
             media_files=media_files,
             ram_bypass_used=ram_bypass_used,
+            copy_message_used=copy_message_used,
             errors=errors,
             skipped_duplicates=skipped_duplicates,
             messages_per_minute=metrics["messages_per_minute"],
@@ -1766,6 +1906,7 @@ class HaumeaServer:
             "processed": completed,
             "media_files": media_files,
             "ram_bypass_used": ram_bypass_used,
+            "copy_message_used": copy_message_used,
             "total": total_scope,
             "errors": errors,
             "skipped_duplicates": skipped_duplicates,
@@ -1777,6 +1918,7 @@ class HaumeaServer:
             "total": total_scope,
             "media_files": media_files,
             "ram_bypass_used": ram_bypass_used,
+            "copy_message_used": copy_message_used,
             "errors": errors,
             "skipped_duplicates": skipped_duplicates,
             "status": status,
@@ -1826,6 +1968,8 @@ class HaumeaServer:
                                 self.sync_state["media_files"] += 1
                             if self._last_send_used_ram_bypass:
                                 self.sync_state["ram_bypass_used"] += 1
+                            if self._last_send_used_copy_message:
+                                self.sync_state["copy_message_used"] += 1
                             if dedupe_state is not None:
                                 self.mark_message_deduped(dedupe_state, msg)
                             if anti_flood_cycle and self.sync_state["processed"] >= anti_flood_cycle["after_messages"]:
@@ -1851,6 +1995,7 @@ class HaumeaServer:
                             "processed": self.sync_state["processed"],
                             "media_files": self.sync_state["media_files"],
                             "ram_bypass_used": self.sync_state["ram_bypass_used"],
+                            "copy_message_used": self.sync_state["copy_message_used"],
                             "skipped_duplicates": self.sync_state["skipped_duplicates"],
                             "errors": self.sync_state["errors"],
                             "poll_interval": poll_interval,
@@ -1882,6 +2027,7 @@ class HaumeaServer:
                     "processed": self.sync_state["processed"],
                     "media_files": self.sync_state["media_files"],
                     "ram_bypass_used": self.sync_state["ram_bypass_used"],
+                    "copy_message_used": self.sync_state["copy_message_used"],
                     "skipped_duplicates": self.sync_state["skipped_duplicates"],
                     "errors": self.sync_state["errors"],
                     "poll_interval": poll_interval,
@@ -1952,6 +2098,7 @@ class HaumeaServer:
             "processed": 0,
             "media_files": 0,
             "ram_bypass_used": 0,
+            "copy_message_used": 0,
             "skipped_duplicates": 0,
             "errors": 0,
             "poll_interval": int(poll_interval or 15),
@@ -1981,6 +2128,7 @@ class HaumeaServer:
             "processed": 0,
             "media_files": 0,
             "ram_bypass_used": 0,
+            "copy_message_used": 0,
             "skipped_duplicates": 0,
             "errors": 0,
             "poll_interval": int(poll_interval or 15),
@@ -2020,6 +2168,7 @@ class HaumeaServer:
             total=self.sync_state.get("processed", 0),
             media_files=self.sync_state.get("media_files", 0),
             ram_bypass_used=self.sync_state.get("ram_bypass_used", 0),
+            copy_message_used=self.sync_state.get("copy_message_used", 0),
             errors=self.sync_state.get("errors", 0),
             skipped_duplicates=self.sync_state.get("skipped_duplicates", 0),
         ))
@@ -2029,11 +2178,13 @@ class HaumeaServer:
             "processed": self.sync_state.get("processed", 0),
             "media_files": self.sync_state.get("media_files", 0),
             "ram_bypass_used": self.sync_state.get("ram_bypass_used", 0),
+            "copy_message_used": self.sync_state.get("copy_message_used", 0),
             "skipped_duplicates": self.sync_state.get("skipped_duplicates", 0),
             "errors": self.sync_state.get("errors", 0),
             "source_title": source_title,
             "dest_title": dest_title,
         })
+        self.log(f"copy_message usado com sucesso na sync contínua: {self.sync_state.get('copy_message_used', 0)}", "info")
         self.log("Sync contínua interrompida.", "warning")
         return {"ok": True, "sync_state": self.sync_state}
 
@@ -2083,6 +2234,7 @@ class HaumeaServer:
         total = len(messages)
         cloned = 0
         ram_bypass_used = 0
+        copy_message_used = 0
         anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
         self.log(f"Clonando {total} msgs de '{source_title}' para tópico...", "info")
 
@@ -2103,6 +2255,8 @@ class HaumeaServer:
                 cloned += 1
                 if self._last_send_used_ram_bypass:
                     ram_bypass_used += 1
+                if self._last_send_used_copy_message:
+                    copy_message_used += 1
                 if anti_flood_cycle and cloned >= anti_flood_cycle["after_messages"]:
                     pause_seconds = anti_flood_cycle["duration"]
                     self.log(
@@ -2122,7 +2276,12 @@ class HaumeaServer:
 
         self.log(f"'{source_title}' concluído: {cloned}/{total}", "success")
         self.log(f"Bypass RAM em '{source_title}': {ram_bypass_used}", "info")
-        return {"cloned": cloned, "ram_bypass_used": ram_bypass_used}
+        self.log(f"copy_message em '{source_title}': {copy_message_used}", "info")
+        return {
+            "cloned": cloned,
+            "ram_bypass_used": ram_bypass_used,
+            "copy_message_used": copy_message_used,
+        }
 
     async def rpc_multi_clone(
         self,
@@ -2158,7 +2317,8 @@ class HaumeaServer:
         await self._get_forum_input_channel(dest_entity, "grupo de destino")
         total_groups = len(sources)
         total_ram_bypass_used = 0
-        self.log("Iniciando multi-clone com bypass RAM automático quando necessário.", "info")
+        total_copy_message_used = 0
+        self.log("Iniciando multi-clone com tentativa de copy_message antes do fallback legado.", "info")
 
         for idx, src in enumerate(sources):
             if self.stop_flag:
@@ -2173,6 +2333,7 @@ class HaumeaServer:
                 "group_index": idx,
                 "total_groups": total_groups,
                 "ram_bypass_used": total_ram_bypass_used,
+                "copy_message_used": total_copy_message_used,
             })
 
             try:
@@ -2200,17 +2361,24 @@ class HaumeaServer:
                     source_topic_id,
                 )
                 total_ram_bypass_used += int((result or {}).get("ram_bypass_used", 0) or 0)
+                total_copy_message_used += int((result or {}).get("copy_message_used", 0) or 0)
             except Exception as e:
                 self.log(f"Erro no grupo '{src}': {e}", "error")
 
         self.log("Multi-clone concluído!", "success")
         self.log(f"Bypass RAM total no multi-clone: {total_ram_bypass_used}", "info")
+        self.log(f"copy_message total no multi-clone: {total_copy_message_used}", "info")
         self.emit_progress({
             "type": "multi",
             "status": "done",
             "ram_bypass_used": total_ram_bypass_used,
+            "copy_message_used": total_copy_message_used,
         })
-        return {"ok": True, "ram_bypass_used": total_ram_bypass_used}
+        return {
+            "ok": True,
+            "ram_bypass_used": total_ram_bypass_used,
+            "copy_message_used": total_copy_message_used,
+        }
 
     async def get_forum_topics(self, entity):
         topics = []
@@ -2279,6 +2447,7 @@ class HaumeaServer:
         total = len(messages)
         cloned = 0
         ram_bypass_used = 0
+        copy_message_used = 0
         errors = 0
         anti_flood_cycle = self._next_anti_flood_cycle(anti_flood, cloned)
         self.log(f"Clonando {total} msgs do tópico '{topic_title}'...", "info")
@@ -2300,6 +2469,8 @@ class HaumeaServer:
                 cloned += 1
                 if self._last_send_used_ram_bypass:
                     ram_bypass_used += 1
+                if self._last_send_used_copy_message:
+                    copy_message_used += 1
                 if anti_flood_cycle and cloned >= anti_flood_cycle["after_messages"]:
                     pause_seconds = anti_flood_cycle["duration"]
                     self.log(
@@ -2318,7 +2489,13 @@ class HaumeaServer:
                 errors += 1
                 self.log(f"Erro msg #{msg.id}: {e}", "error")
 
-        return {"cloned": cloned, "ram_bypass_used": ram_bypass_used, "errors": errors}
+        self.log(f"copy_message no tópico '{topic_title}': {copy_message_used}", "info")
+        return {
+            "cloned": cloned,
+            "ram_bypass_used": ram_bypass_used,
+            "copy_message_used": copy_message_used,
+            "errors": errors,
+        }
 
     async def rpc_forum_clone(
         self,
@@ -2366,6 +2543,7 @@ class HaumeaServer:
             source_topics = await self.get_forum_topics(source_entity)
         total_topics = len(source_topics)
         total_ram_bypass_used = 0
+        total_copy_message_used = 0
         total_errors = 0
         self.log(f"Encontrados {total_topics} tópicos no fórum de origem", "info")
 
@@ -2378,6 +2556,7 @@ class HaumeaServer:
                 "type": "forum", "topic_index": idx, "total_topics": total_topics,
                 "topic_title": topic['title'],
                 "ram_bypass_used": total_ram_bypass_used,
+                "copy_message_used": total_copy_message_used,
                 "errors": total_errors,
             })
 
@@ -2389,6 +2568,7 @@ class HaumeaServer:
                     limit, delay, anti_flood, topic['title']
                 )
                 total_ram_bypass_used += int((topic_result or {}).get("ram_bypass_used", 0) or 0)
+                total_copy_message_used += int((topic_result or {}).get("copy_message_used", 0) or 0)
                 total_errors += int((topic_result or {}).get("errors", 0) or 0)
             except Exception as e:
                 total_errors += 1
@@ -2396,14 +2576,21 @@ class HaumeaServer:
 
         self.log("Clonagem de fórum concluída!", "success")
         self.log(f"Bypass RAM total no clone de fórum: {total_ram_bypass_used}", "info")
+        self.log(f"copy_message total no clone de fórum: {total_copy_message_used}", "info")
         self.emit_progress({
             "type": "forum",
             "status": "done",
             "ram_bypass_used": total_ram_bypass_used,
+            "copy_message_used": total_copy_message_used,
             "errors": total_errors,
             "total_topics": total_topics,
         })
-        return {"ok": True, "ram_bypass_used": total_ram_bypass_used, "errors": total_errors}
+        return {
+            "ok": True,
+            "ram_bypass_used": total_ram_bypass_used,
+            "copy_message_used": total_copy_message_used,
+            "errors": total_errors,
+        }
 
 # ── Main Loop ──
 
